@@ -10,4 +10,6 @@
 
 @interface AudioController : NSObject
 
+-(void) startAudio;
+
 @end
