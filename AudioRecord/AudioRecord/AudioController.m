@@ -15,11 +15,24 @@
 #define TRYR(expr) {int s = (expr); if (s != noErr) { DLog(@"Error %d in " #expr " %@", s, OSStatusErrorDescription(s)); return s; }}
 #define TRYE(expr) {NSError *error = nil; BOOL s = (expr); if (!s || error) { DLog(@"Error %@ in " #expr, error.localizedDescription); return 1; }}
 
+typedef struct BufferStruct {
+    uint32_t length;
+    uint32_t minReturnLength;
+    uint32_t curerntLength;
+    double firstSampleNumber;
+    Float32 *data;
+} BufferStruct;
+
 typedef struct AudioDataStruct {
     double sampleRate;
     double bufferDuration;
     uint32_t maxFramesPerSlice;
     AudioUnit audioUnit;
+    BufferStruct *buffer;
+    double genDuration;
+    Float32 *genPattern;
+    uint32_t genPatternLength;
+    double frequency;
 } AudioDataStruct;
 
 AudioDataStruct *adStruct;
@@ -30,30 +43,42 @@ AudioDataStruct *adStruct;
 
 @implementation AudioController
 
+#pragma mark Lifecycle
+
 -(id) init {
     self = [super init];
     if (self) {
-        adStruct = calloc(1, sizeof(adStruct));
+        adStruct = calloc(1, sizeof(*adStruct));
     }
     return self;
 }
 
 - (void) dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    freeBuffer();
     free(adStruct);
     //TODO: stop audiounit, dealloc it
 }
 
+#pragma mark Public interface
+
 -(void) startAudio {
+
     [self setupAudioSession];
+    adStruct->genDuration = 0.01; //10ms
+    setupBuffer();
+    setupPattern();
     [self setupIOUnit];
+
     [self startIOUnit];
 }
+
+#pragma mark Initialization
 
 -(OSStatus) setupAudioSession {
     AVAudioSession *sessionInstance = [AVAudioSession sharedInstance];
     
-    adStruct->bufferDuration = .005; //5 ms, 220.5 samples in 44100
+    adStruct->bufferDuration = 0.005; //5 ms, 220.5 samples in 44100
     adStruct->sampleRate = 44100;
     
     TRYE([sessionInstance setCategory:AVAudioSessionCategoryPlayAndRecord error:&error]);
@@ -186,6 +211,8 @@ AudioDataStruct *adStruct;
     [self startAudio];
 }
 
+#pragma mark Functions
+
 static NSString *OSStatusErrorDescription(OSStatus error) {
     NSDictionary *statuses = @{@"-10830": @"kMIDIInvalidClient",
                                @"-10831": @"kMIDIInvalidPort",
@@ -294,32 +321,93 @@ static OSStatus	performRender (void                         *inRefCon,
                                AudioBufferList              *ioData)
 {
     TRYR(AudioUnitRender(adStruct->audioUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, ioData));
-    
+    addToBuffer(ioData->mBuffers[0].mData, inNumberFrames, inTimeStamp->mSampleTime); //assume that we have only one channel/buffer
+    double peakAmplitude;
+    double peakTime = getMaxPatternMatch(&peakAmplitude);
+    if (peakAmplitude>0.5) {
+        printf("l: %d t: %f Peak: %f Amp: %f\n", inNumberFrames, inTimeStamp->mSampleTime/adStruct->sampleRate, peakTime, peakAmplitude);
+    }
+
     for (UInt32 i=0; i<ioData->mNumberBuffers; ++i) {
         Float32 *data = ioData->mBuffers[i].mData;
-        double min = 0;
-        double max = 0;
-        double avg = 0;
         for (NSUInteger frame = 0; frame < inNumberFrames; frame++) {
-            min = MIN(min, data[frame]);
-            max = MAX(max, data[frame]);
-            avg += data[frame];
-        }
-        avg = avg/inNumberFrames;
-        printf("l: %d t: %f MIN: %f  MAX: %f  AVG: %f\n", inNumberFrames, inTimeStamp->mSampleTime/adStruct->sampleRate, min, max, avg);
-        //        memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
-        for (NSUInteger frame = 0; frame < inNumberFrames; frame++) {
-            double t = (inTimeStamp->mSampleTime + frame)/adStruct->sampleRate;
-            if (t - floor(t)<0.01) {
-                data[frame] = sin(t*M_PI*2*14700);
-            } else {
+            double gframe = inTimeStamp->mSampleTime + frame;
+            double t = gframe/adStruct->sampleRate;
+            double dt = t - floor(t);
+//            if (dt < adStruct->genDuration) {
+//                data[frame] = sin(dt*M_PI*2*adStruct->frequency);
+////                data[frame] = adStruct->genPattern[frame];
+//            } else {
                 data[frame] = 0;
-            }
+//            }
         }
         
     }
     
     return noErr;
+}
+
+void setupPattern() {
+    adStruct->genPatternLength = adStruct->sampleRate * adStruct->genDuration;
+    adStruct->frequency = adStruct->sampleRate/3;
+    adStruct->genPattern = calloc(adStruct->genPatternLength, sizeof(Float32));
+    for (NSUInteger frame = 0; frame < adStruct->genPatternLength; frame++) {
+        double t = ((double)frame) / adStruct->sampleRate;
+        adStruct->genPattern[frame] = sin(t*M_PI*2*adStruct->frequency);
+    }
+}
+
+void setupBuffer() {
+    adStruct->buffer = calloc(1, sizeof(*(adStruct->buffer)));
+    BufferStruct *buf = adStruct->buffer;
+    
+    buf->minReturnLength = 0.01 * adStruct->sampleRate * 3;
+    buf->length = buf->minReturnLength * 2;
+    buf->data = calloc(buf->length, sizeof(Float32));
+    buf->curerntLength = buf->minReturnLength;
+}
+
+void freeBuffer() {
+    free(adStruct->buffer->data);
+    free(adStruct->buffer);
+    adStruct->buffer = nil;
+}
+
+void addToBuffer(Float32 *data, uint32_t dataLength, double sampleTime) { //data length in doubles, not in bytes; assume that data length < minreturnlength
+    BufferStruct *buf = adStruct->buffer;
+    if (buf->curerntLength+dataLength>buf->length) {
+        void *dst = buf->data;
+        void *src = &(buf->data[buf->curerntLength - buf->minReturnLength + dataLength]);
+        memcpy(dst, src, sizeof(Float32) * (buf->minReturnLength - dataLength));
+        buf->curerntLength = buf->minReturnLength - dataLength;
+    }
+    void *dst = &(buf->data[buf->curerntLength]);
+    void *src = data;
+    memcpy(dst, src, dataLength * sizeof(Float32));
+    buf->firstSampleNumber = sampleTime - buf->curerntLength;
+    buf->curerntLength += dataLength;
+}
+
+Float32 *getFromBuffer(uint32_t dataLength, double *sampleTime) {
+    BufferStruct *buf = adStruct->buffer;
+    Float32 *result = &(buf->data[buf->curerntLength - dataLength]);
+
+    *sampleTime = buf->firstSampleNumber + buf->curerntLength - dataLength;
+    return result;
+}
+
+double getMaxPatternMatch(double *amplitude) {
+    double bufferTime;
+    Float32 *bufferData = getFromBuffer(adStruct->genPatternLength*3, &bufferTime);
+    Float32 *convResult = calloc(adStruct->genPatternLength*3, sizeof(Float32));
+    vDSP_conv(bufferData, 1, adStruct->genPattern, 1, convResult, 1, adStruct->genPatternLength*2, adStruct->genPatternLength);
+    Float32 max;
+    uint32_t maxi;
+    vDSP_maxmgvi(convResult, 1, &max, &maxi, adStruct->genPatternLength*2);
+//    printf("%f %zu \n", max, maxi);
+    free(convResult);
+    *amplitude = max;
+    return maxi;
 }
 
 @end
