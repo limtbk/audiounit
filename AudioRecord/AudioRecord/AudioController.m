@@ -18,7 +18,7 @@
 typedef struct BufferStruct {
     uint32_t length;
     uint32_t minReturnLength;
-    uint32_t curerntLength;
+    uint32_t currentLength;
     double firstSampleNumber;
     Float32 *data;
 } BufferStruct;
@@ -33,6 +33,14 @@ typedef struct AudioDataStruct {
     Float32 *genPattern;
     uint32_t genPatternLength;
     double frequency;
+    double timeoutTime;
+    double gapTime;
+    double histTimePeak;
+    double lastTimePeak;
+    double lastTimePeakAmp;
+    double playTime;
+    double lastPlayTime;
+    double threshold;
 } AudioDataStruct;
 
 AudioDataStruct *adStruct;
@@ -68,6 +76,7 @@ AudioDataStruct *adStruct;
     adStruct->genDuration = 0.01; //10ms
     setupBuffer();
     setupPattern();
+    adStruct->gapTime = adStruct->genDuration * 2 * adStruct->sampleRate;
     [self setupIOUnit];
 
     [self startIOUnit];
@@ -80,6 +89,8 @@ AudioDataStruct *adStruct;
     
     adStruct->bufferDuration = 0.005; //5 ms, 220.5 samples in 44100
     adStruct->sampleRate = 44100;
+    adStruct->timeoutTime = 0.5 * adStruct->sampleRate;
+    adStruct->threshold = 0.1;
     
     TRYE([sessionInstance setCategory:AVAudioSessionCategoryPlayAndRecord error:&error]);
     TRYE([sessionInstance setPreferredIOBufferDuration:adStruct->bufferDuration error:&error]);
@@ -320,26 +331,81 @@ static OSStatus	performRender (void                         *inRefCon,
                                UInt32 						inNumberFrames,
                                AudioBufferList              *ioData)
 {
+    static BOOL flGap = NO;
+    static BOOL flPly = NO;
     TRYR(AudioUnitRender(adStruct->audioUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, ioData));
     addToBuffer(ioData->mBuffers[0].mData, inNumberFrames, inTimeStamp->mSampleTime); //assume that we have only one channel/buffer
     double peakAmplitude;
     double peakTime = getMaxPatternMatch(&peakAmplitude);
-    if (peakAmplitude>0.5) {
-        printf("l: %d t: %f Peak: %f Amp: %f\n", inNumberFrames, inTimeStamp->mSampleTime/adStruct->sampleRate, peakTime, peakAmplitude);
+    if (peakAmplitude>adStruct->threshold) {
+//        printf("l: %d t: %f Peak: %f Amp: %f\n", inNumberFrames, inTimeStamp->mSampleTime/adStruct->sampleRate, peakTime, peakAmplitude);
+        
+        if (peakTime - adStruct->lastTimePeak < adStruct->buffer->minReturnLength) {
+            if (adStruct->lastTimePeakAmp<peakAmplitude) {
+                adStruct->lastTimePeak = peakTime;
+                adStruct->lastTimePeakAmp = peakAmplitude;
+                flGap = YES;
+            } else { //Amp go down, so max is found
+                if (flGap) {
+//                    printf("t: %f l: %d Peak: %f Amp: %f LP: %f\n", inTimeStamp->mSampleTime, (unsigned int)inNumberFrames, adStruct->lastTimePeak, adStruct->lastTimePeakAmp, adStruct->playTime);
+                    printf("t: %f l: %d Peak: %f Amp: %f LP: %f Dt: %f\n", inTimeStamp->mSampleTime, (unsigned int)inNumberFrames, adStruct->lastTimePeak, adStruct->lastTimePeakAmp, adStruct->playTime, adStruct->lastTimePeak - adStruct->playTime);
+                    if ((adStruct->playTime > inTimeStamp->mSampleTime) || (adStruct->playTime+adStruct->genPatternLength < inTimeStamp->mSampleTime)) { //if already played or not start play yet
+                        adStruct->playTime = adStruct->lastTimePeak + adStruct->gapTime;
+                        flPly = YES;
+                    } else {
+                        printf("Play already launched");
+                    }
+                }
+                flGap = NO;
+            }
+        } else {
+            adStruct->histTimePeak = adStruct->lastTimePeak;
+            adStruct->lastTimePeak = peakTime;
+            adStruct->lastTimePeakAmp = peakAmplitude;
+            /*
+            printf("t: %f l: %d Peak: %f Amp: %f LP: %f\n", inTimeStamp->mSampleTime, (unsigned int)inNumberFrames, peakTime, peakAmplitude, adStruct->playTime);
+            if ((adStruct->playTime > inTimeStamp->mSampleTime) || (adStruct->playTime+adStruct->genPatternLength < inTimeStamp->mSampleTime)) { //if already played or not start play yet
+                adStruct->playTime = adStruct->lastTimePeak + adStruct->gapTime;
+            } else {
+                printf("Play already launched");
+            }
+             */
+        }
     }
 
+    if (ABS(inTimeStamp->mSampleTime - adStruct->playTime) > adStruct->timeoutTime) {
+        adStruct->playTime = inTimeStamp->mSampleTime + adStruct->timeoutTime/2;
+    }
+    
+    if ((inTimeStamp->mSampleTime > adStruct->playTime) && (inTimeStamp->mSampleTime < adStruct->playTime + adStruct->genPatternLength)) {
+        if (flPly) {
+//            printf("t: %f Play: %f\n", inTimeStamp->mSampleTime, adStruct->playTime);
+            adStruct->lastPlayTime = adStruct->playTime;
+        }
+        flPly = NO;
+    }
+    
     for (UInt32 i=0; i<ioData->mNumberBuffers; ++i) {
         Float32 *data = ioData->mBuffers[i].mData;
         for (NSUInteger frame = 0; frame < inNumberFrames; frame++) {
             double gframe = inTimeStamp->mSampleTime + frame;
-            double t = gframe/adStruct->sampleRate;
-            double dt = t - floor(t);
+//            double t = gframe/adStruct->sampleRate;
+//            double dt = t - floor(t);
 //            if (dt < adStruct->genDuration) {
 //                data[frame] = sin(dt*M_PI*2*adStruct->frequency);
 ////                data[frame] = adStruct->genPattern[frame];
 //            } else {
-                data[frame] = 0;
+//                data[frame] = 0;
 //            }
+
+            if ((gframe > adStruct->playTime) && (gframe < adStruct->playTime + adStruct->genPatternLength)) {
+                uint32_t patternIndex = gframe - adStruct->playTime;
+                data[frame] = adStruct->genPattern[patternIndex];
+//                data[frame] = 0;
+            } else {
+                data[frame] = 0;
+            }
+        
         }
         
     }
@@ -361,10 +427,10 @@ void setupBuffer() {
     adStruct->buffer = calloc(1, sizeof(*(adStruct->buffer)));
     BufferStruct *buf = adStruct->buffer;
     
-    buf->minReturnLength = 0.01 * adStruct->sampleRate * 3;
+    buf->minReturnLength = adStruct->genDuration * adStruct->sampleRate * 3;
     buf->length = buf->minReturnLength * 2;
     buf->data = calloc(buf->length, sizeof(Float32));
-    buf->curerntLength = buf->minReturnLength;
+    buf->currentLength = buf->minReturnLength;
 }
 
 void freeBuffer() {
@@ -373,26 +439,26 @@ void freeBuffer() {
     adStruct->buffer = nil;
 }
 
-void addToBuffer(Float32 *data, uint32_t dataLength, double sampleTime) { //data length in doubles, not in bytes; assume that data length < minreturnlength
+void addToBuffer(Float32 *data, uint32_t dataLength, double sampleTime) { //data length in samples, not in bytes; assume that data length < minreturnlength
     BufferStruct *buf = adStruct->buffer;
-    if (buf->curerntLength+dataLength>buf->length) {
+    if (buf->currentLength+dataLength>buf->length) {
         void *dst = buf->data;
-        void *src = &(buf->data[buf->curerntLength - buf->minReturnLength + dataLength]);
+        void *src = &(buf->data[buf->currentLength - buf->minReturnLength + dataLength]);
         memcpy(dst, src, sizeof(Float32) * (buf->minReturnLength - dataLength));
-        buf->curerntLength = buf->minReturnLength - dataLength;
+        buf->currentLength = buf->minReturnLength - dataLength;
     }
-    void *dst = &(buf->data[buf->curerntLength]);
+    void *dst = &(buf->data[buf->currentLength]);
     void *src = data;
     memcpy(dst, src, dataLength * sizeof(Float32));
-    buf->firstSampleNumber = sampleTime - buf->curerntLength;
-    buf->curerntLength += dataLength;
+    buf->firstSampleNumber = sampleTime - buf->currentLength;
+    buf->currentLength += dataLength;
 }
 
 Float32 *getFromBuffer(uint32_t dataLength, double *sampleTime) {
     BufferStruct *buf = adStruct->buffer;
-    Float32 *result = &(buf->data[buf->curerntLength - dataLength]);
+    Float32 *result = &(buf->data[buf->currentLength - dataLength]);
 
-    *sampleTime = buf->firstSampleNumber + buf->curerntLength - dataLength;
+    *sampleTime = buf->firstSampleNumber + buf->currentLength - dataLength;
     return result;
 }
 
@@ -402,12 +468,11 @@ double getMaxPatternMatch(double *amplitude) {
     Float32 *convResult = calloc(adStruct->genPatternLength*3, sizeof(Float32));
     vDSP_conv(bufferData, 1, adStruct->genPattern, 1, convResult, 1, adStruct->genPatternLength*2, adStruct->genPatternLength);
     Float32 max;
-    uint32_t maxi;
+    vDSP_Length maxi;
     vDSP_maxmgvi(convResult, 1, &max, &maxi, adStruct->genPatternLength*2);
-//    printf("%f %zu \n", max, maxi);
     free(convResult);
     *amplitude = max;
-    return maxi;
+    return maxi+bufferTime;
 }
 
 @end
